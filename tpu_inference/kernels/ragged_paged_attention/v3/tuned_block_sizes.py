@@ -4375,7 +4375,7 @@ def get_tuned_block_sizes(
         match tpu_version:
             case 4:
                 # TPUv4 has much smaller VMEM size so we pick fixed block sizes.
-                bkv_p, bq = (512 // page_size, 32)
+                bkv_p, bq = (max(1, 512 // page_size), 32)
             case 7:
                 bkv_p, bq = (4096 // page_size, 32)
             case _:

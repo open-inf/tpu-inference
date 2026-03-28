@@ -1,0 +1,16 @@
+{
+  "256": {
+    "q_bfloat16_kv_bfloat16": {
+      "q_head-16_kv_head-2_head-128": {
+        "max_model_len-4096-sw-None": [2, 32]
+      }
+    }
+  },
+  "2048": {
+    "q_bfloat16_kv_bfloat16": {
+      "q_head-4_kv_head-1_head-256": {
+        "max_model_len-8192-sw-None": [1, 32]
+      }
+    }
+  }
+}

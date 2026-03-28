@@ -1501,7 +1501,7 @@ def get_default_block_sizes(
                           num_kv_heads_x2)
 
     match tpu_version:
-        case 5 | 6:
+        case 4 | 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
                 bkv_sz = min(min_bkv_sz_to_peak, max_kv)
@@ -1854,6 +1854,21 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
+            try:
+                from tpu_inference.kernels.ragged_paged_attention.v3.tuned_block_sizes import get_tuned_block_sizes
+                bkv_p, bq = get_tuned_block_sizes(
+                    q.dtype, kv_cache.dtype,
+                    actual_num_q_heads, actual_num_kv_heads,
+                    head_dim, page_size, max_num_tokens, pages_per_seq,
+                )
+                return {
+                    "bq_sz": bq,
+                    "bkv_sz": bkv_p * page_size,
+                    "bq_csz": bq,
+                    "bkv_csz": bkv_p * page_size,
+                }
+            except Exception:
+                pass
             return get_default_block_sizes(
                 q.dtype,
                 kv_cache.dtype,

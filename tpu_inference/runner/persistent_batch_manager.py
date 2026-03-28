@@ -176,16 +176,23 @@ class PersistentBatchManager:
 
                 hf_config = self.model_config.hf_config
 
-                self.requests[req_id].mrope_positions, self.requests[
-                    req_id].mrope_position_delta = get_mrope_input_positions_fn(
-                        self.requests[req_id].prompt_token_ids,
-                        hf_config=hf_config,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        second_per_grid_ts=second_per_grid_ts,
-                        audio_feature_lengths=audio_feature_lengths,
-                        use_audio_in_video=use_audio_in_video,
-                    )
+                try:
+                    self.requests[req_id].mrope_positions, self.requests[
+                        req_id].mrope_position_delta = get_mrope_input_positions_fn(
+                            self.requests[req_id].prompt_token_ids,
+                            hf_config=hf_config,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            second_per_grid_ts=second_per_grid_ts,
+                            audio_feature_lengths=audio_feature_lengths,
+                            use_audio_in_video=use_audio_in_video,
+                        )
+                except TypeError:
+                    self.requests[req_id].mrope_positions, self.requests[
+                        req_id].mrope_position_delta = get_mrope_input_positions_fn(
+                            self.requests[req_id].prompt_token_ids,
+                            self.requests[req_id].mm_features,
+                        )
 
         # Update the states of the running/resumed requests.
         req_data = scheduler_output.scheduled_cached_reqs

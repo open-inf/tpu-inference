@@ -354,8 +354,11 @@ def get_default_gmm_block_sizes(m: int, k: int, n: int,
             break
     # k/n correspond to n_input_features/n_output_features in the matmul so they
     # are normally greater than 2048, unless the num shards is large.
-    tk = round_up_to_multiple_of_128_within_limit(k, 2048)
-    tn = round_up_to_multiple_of_128_within_limit(n, 2048)
+    from tpu_inference.kernels.ragged_paged_attention.v3.util import get_tpu_version
+    tpu_ver = get_tpu_version()
+    kn_limit = 512 if tpu_ver <= 4 else 2048
+    tk = round_up_to_multiple_of_128_within_limit(k, kn_limit)
+    tn = round_up_to_multiple_of_128_within_limit(n, kn_limit)
     return tm, tk, tn
 
 

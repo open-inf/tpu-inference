@@ -270,6 +270,59 @@ class TpuPlatform(Platform):
                            "Forcing --disable_chunked_mm_input.")
             scheduler_config.disable_chunked_mm_input = True
 
+        # On TPU with UniProcExecutor, models see TP=1 at runtime
+        # (sharding is handled by JAX mesh). Recalculate mamba page size
+        # padding using TP=1 shapes to match what the runtime model will
+        # produce.
+        if (parallel_config.distributed_executor_backend == "uni"
+                and parallel_config.tensor_parallel_size > 1
+                and cache_config is not None
+                and vllm_config.model_config is not None):
+            from vllm.model_executor.models.registry import ModelRegistry
+            from vllm.v1.kv_cache_interface import MambaSpec
+            try:
+                model_cls, _ = ModelRegistry.resolve_model_cls(
+                    vllm_config.model_config.architecture,
+                    model_config=vllm_config.model_config,
+                )
+                if hasattr(model_cls, 'get_mamba_state_shape_from_config'):
+                    orig_tp = parallel_config.tensor_parallel_size
+                    parallel_config.tensor_parallel_size = 1
+                    runtime_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+                    runtime_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+                    parallel_config.tensor_parallel_size = orig_tp
+                    runtime_mamba_page = MambaSpec(
+                        shapes=runtime_shapes,
+                        dtypes=runtime_dtypes,
+                        block_size=-1,
+                    ).page_size_bytes
+                    if runtime_mamba_page > 0:
+                        from vllm.v1.kv_cache_interface import FullAttentionSpec
+                        kv_dtype = vllm_config.model_config.dtype
+                        total_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+                        attn_page_1 = FullAttentionSpec(
+                            block_size=1,
+                            num_kv_heads=total_kv_heads,
+                            head_size=vllm_config.model_config.get_head_size(),
+                            dtype=kv_dtype,
+                        ).page_size_bytes
+                        from math import ceil
+                        needed_block = 16 * ceil(runtime_mamba_page / (16 * attn_page_1))
+                        if needed_block > cache_config.block_size:
+                            cache_config.block_size = needed_block
+                            logger.info(
+                                "TPU UniProc: adjusted block size to %d for "
+                                "runtime Mamba page size compatibility.",
+                                needed_block)
+                        new_attn_page = cache_config.block_size * attn_page_1
+                        if new_attn_page >= runtime_mamba_page:
+                            cache_config.mamba_page_size_padded = new_attn_page
+                            logger.info(
+                                "TPU UniProc: set mamba_page_size_padded=%d",
+                                new_attn_page)
+            except Exception as e:
+                logger.warning("Could not recalculate mamba page size for TPU: %s", e)
+
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             assert kv_transfer_config.kv_connector == "TPUConnector"
