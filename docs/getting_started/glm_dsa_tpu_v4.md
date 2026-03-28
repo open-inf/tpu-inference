@@ -47,6 +47,9 @@ source vllm_env/bin/activate
 cd vllm
 uv pip install -r requirements/tpu.txt
 VLLM_TARGET_DEVICE="tpu" uv pip install -e .
+
+# Upgrade transformers (pinned version doesn't recognize glm_moe_dsa)
+uv pip install --upgrade transformers "numpy<2.4"
 cd ..
 
 # Install tpu-inference
