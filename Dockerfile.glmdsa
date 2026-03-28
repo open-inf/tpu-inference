@@ -1,0 +1,41 @@
+FROM python:3.12-slim
+
+# System deps
+RUN apt-get update && apt-get install -y \
+    git curl libopenblas-base libopenmpi-dev libomp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /workspace
+
+# Clone tpu-inference (glmdsa branch)
+RUN git clone -b glmdsa https://github.com/open-inf/tpu-inference.git
+
+# Clone and patch vLLM
+RUN export VLLM_COMMIT_HASH="$(cat tpu-inference/.buildkite/vllm_lkg.version)" && \
+    git clone https://github.com/vllm-project/vllm.git && \
+    cd vllm && git checkout "${VLLM_COMMIT_HASH}" && \
+    git apply ../tpu-inference/patches/vllm-glmdsa-tpuv4.patch && \
+    cd ..
+
+# Create venv and install
+RUN uv venv /workspace/vllm_env --python 3.12
+ENV VIRTUAL_ENV="/workspace/vllm_env"
+ENV PATH="/workspace/vllm_env/bin:$PATH"
+
+RUN cd vllm && \
+    uv pip install -r requirements/tpu.txt && \
+    VLLM_TARGET_DEVICE=tpu uv pip install -e . && \
+    cd ..
+
+RUN cd tpu-inference && uv pip install -e . && cd ..
+
+# Upgrade transformers for glm_moe_dsa support
+RUN uv pip install --upgrade transformers "numpy<2.4"
+
+ENV MODEL_IMPL_TYPE=vllm
+
+ENTRYPOINT ["vllm", "serve"]
