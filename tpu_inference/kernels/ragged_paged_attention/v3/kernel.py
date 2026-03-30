@@ -1501,7 +1501,7 @@ def get_default_block_sizes(
                           num_kv_heads_x2)
 
     match tpu_version:
-        case 5 | 6:
+        case 4 | 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
                 bkv_sz = min(min_bkv_sz_to_peak, max_kv)

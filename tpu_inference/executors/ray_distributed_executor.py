@@ -36,12 +36,7 @@ from vllm.v1.executor.ray_utils import RayWorkerWrapper as RayWorkerWrapperV1
 from vllm.v1.executor.ray_utils import _wait_until_pg_ready
 from vllm.v1.outputs import ModelRunnerOutput
 
-from tpu_inference.distributed.jax_parallel_state import get_pp_group
-from tpu_inference.distributed.utils import set_node_kv_ip_port
 from tpu_inference.logger import init_logger
-from tpu_inference.models.jax.jax_intermediate_tensor import \
-    JaxIntermediateTensors
-from tpu_inference.runner.tpu_runner import AsyncTPUModelRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -121,7 +116,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         if self.has_connector:
             ip_port = self.collective_rpc("get_node_kv_ip_port")
             for item in ip_port:
-                set_node_kv_ip_port(item)
+                from tpu_inference.distributed.utils import set_node_kv_ip_port as _set
+                _set(item)
         self.uses_sampler = self.vllm_config.model_config.runner_type != "pooling" and (
             self.vllm_config.ec_transfer_config is None
             or not self.vllm_config.ec_transfer_config.is_ec_producer)
@@ -361,6 +357,29 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
             ",".join(map(str, node_tpus[node_id])),
         } for (node_id, _) in worker_node_and_tpu_ids]
 
+        # For multi-host TP (PP=1): inject JAX multi-process env vars so that
+        # each worker's JAX sees the full device set across all hosts.
+        # These MUST be set before JAX imports (via update_environment_variables).
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size == 1 and n_nodes > 1:
+            sorted_ips = sorted(all_ips)
+            coordinator_port = "8476"
+            process_addresses = ",".join(
+                f"{ip}:{coordinator_port}" for ip in sorted_ips)
+            for i, (node_id, _) in enumerate(worker_node_and_tpu_ids):
+                worker_ip = sorted_worker_metadata[i].ip
+                task_id = sorted_ips.index(worker_ip)
+                all_args_to_update_environment_variables[i].update({
+                    "TPU_PROCESS_ADDRESSES": process_addresses,
+                    "TPU_PROCESS_PORT": coordinator_port,
+                    "CLOUD_TPU_TASK_ID": str(task_id),
+                    "TPU_PROCESS_BOUNDS": f"1,1,{n_nodes}",
+                    "TPU_CHIPS_PER_PROCESS_BOUNDS": "2,2,1",
+                })
+            logger.info(
+                f"Multi-host TP: {n_nodes} nodes, "
+                f"process_addresses={process_addresses}")
+
         # Environment variables to copy from driver to workers
         env_vars_to_copy = get_env_vars_to_copy(
             exclude_vars=self.WORKER_SPECIFIC_ENV_VARS,
@@ -496,9 +515,11 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
         self.result_id = int(0)
 
     def _is_intermediate_tensors(self, output) -> bool:
+        from tpu_inference.models.jax.jax_intermediate_tensor import JaxIntermediateTensors
         return isinstance(output, JaxIntermediateTensors)
 
     def _is_last_rank(self) -> bool:
+        from tpu_inference.distributed.jax_parallel_state import get_pp_group
         return get_pp_group().is_last_rank
 
     # Override the execute_model method to suppprt async scheduling.
@@ -543,6 +564,7 @@ class RayWorkerWrapper(RayWorkerWrapperV1):
                 and self.vllm_config.scheduler_config.async_scheduling)
         output = self._execute_model_outputs.pop(result_id, None)
         assert output is not None, f"No output found for result_id {result_id}"
+        from tpu_inference.runner.tpu_runner import AsyncTPUModelRunnerOutput
         if isinstance(output, AsyncTPUModelRunnerOutput):
             return output.get_output()
         return output

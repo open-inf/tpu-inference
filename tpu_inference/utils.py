@@ -125,10 +125,10 @@ def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
         return pathways_hbm_usage_gb(devices)
 
     multihost_backend = envs.TPU_MULTIHOST_BACKEND
-    if multihost_backend == "ray":
+    is_multihost = multihost_backend == "ray" or jax.process_count() > 1
+    if is_multihost:
         # MemoryStats is only supported for addressable PjRt devices.
         # Assume all the devices have similar memory usage for now.
-        # TODO(ranlihao): find a proper way to get the memory usage of each device.
         for device in devices:
             try:
                 hbm_used = device.memory_stats()["bytes_in_use"]
