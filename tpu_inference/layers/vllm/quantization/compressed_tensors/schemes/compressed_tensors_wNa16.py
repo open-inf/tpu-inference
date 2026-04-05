@@ -1,3 +1,4 @@
+# compressed_tensors_wNa16.py
 # Copyright 2025 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,12 +72,6 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
             raise ValueError(
                 f"Unsupported num_bits = {num_bits}. "
                 f"Supported num_bits = {WNA16_SUPPORTED_BITS}")
-
-        if self.group_size == -1 and self.strategy != "channel":
-            raise ValueError(
-                "WNA16 requires group quantization or channelwise "
-                "quantization, but found no group size and strategy "
-                "is not channelwise.")
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -175,89 +170,59 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
             )
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight_packed = t2j(layer.weight_packed, use_dlpack=False)
-        delattr(layer, "weight_packed")
+    def _unpack_packed_tensor(self, packed: jax.Array) -> jax.Array:
+        """Unpack int32-packed weights to individual values."""
+        if self.num_bits == 4:
+            return ct_u32_unpack_u4(packed)
+        u8 = jax.lax.bitcast_convert_type(packed, jnp.uint8)
+        return jnp.reshape(u8, u8.shape[:-2] + (-1,))
 
-        weight_scale = t2j(layer.weight_scale, use_dlpack=False)
-        delattr(layer, "weight_scale")
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        sort_indices = None
+        if hasattr(layer, "weight_g_idx"):
+            g_idx_tensor = layer.weight_g_idx
+            if not (g_idx_tensor < 0).any():
+                g_idx = t2j(g_idx_tensor.to(torch.int32), use_dlpack=False)
+                # Optimization: Sort weights by group at load time
+                sort_indices = jnp.argsort(g_idx)
+            delattr(layer, "weight_g_idx")
 
         if hasattr(layer, "weight_shape"):
             delattr(layer, "weight_shape")
 
-        g_idx = None
-        if hasattr(layer, "weight_g_idx"):
-            g_idx_torch = layer.weight_g_idx
-            if not (g_idx_torch < 0).any():
-                g_idx = t2j(g_idx_torch, use_dlpack=False)
-            delattr(layer, "weight_g_idx")
+        weight = t2j(layer.weight_packed, use_dlpack=False)
+        delattr(layer, "weight_packed")
+
+        weight_scale = t2j(layer.weight_scale, use_dlpack=False)
+        delattr(layer, "weight_scale")
 
         zero_point = None
         if not self.symmetric and hasattr(layer, "weight_zero_point"):
             zero_point = t2j(layer.weight_zero_point, use_dlpack=False)
             delattr(layer, "weight_zero_point")
 
-        if layer.bias is not None and not layer.skip_bias_add:
-            if layer.return_bias:
-                logger.warning_once("Bias might return incorrect value.")
+        bias = None
+        if (hasattr(layer, 'bias') and layer.bias is not None
+                and not layer.skip_bias_add):
             bias = t2j(layer.bias, use_dlpack=False)
             delattr(layer, "bias")
-        else:
-            bias = None
-
-        group_size = self.group_size
-        symmetric = self.symmetric
-        num_bits = self.num_bits
-        has_g_idx = g_idx is not None
-
-        if has_g_idx:
-            perm = jnp.argsort(g_idx)
-            inv_perm = jnp.argsort(perm)
-        else:
-            perm = None
-            inv_perm = None
 
         @jax.jit
-        def process_wna16_linear_weights(
-            weight_packed: jax.Array,
-            weight_scale: jax.Array,
-            zero_point: jax.Array | None,
-            bias: jax.Array | None,
-            perm: jax.Array | None,
-            inv_perm: jax.Array | None,
-        ) -> LinearWeights:
-            weight = ct_u32_unpack_u4(weight_packed)
+        def process_wna16_weights(weight, weight_scale, zero_point, bias, sort_indices):
+            unpacked_weight = self._unpack_packed_tensor(weight).astype(jnp.int8)
 
-            if has_g_idx:
-                weight = weight[:, perm]
-
-            input_size = weight.shape[1]
-            effective_group_size = input_size if group_size == -1 else group_size
-            num_groups = input_size // effective_group_size
-            weight = weight.reshape(
-                (weight.shape[0], num_groups, effective_group_size))
-
-            if not symmetric and zero_point is not None:
-                zero_point = ct_u32_unpack_u4(zero_point)
-
-            scales = jnp.expand_dims(weight_scale, -1)
-            weight_f = weight.astype(jnp.bfloat16)
-            if not symmetric and zero_point is not None:
-                zp = jnp.expand_dims(zero_point.astype(jnp.bfloat16), -1)
-                weight_deq = (weight_f - zp) * scales
-            else:
-                offset = jnp.array(1 << (num_bits - 1), dtype=jnp.bfloat16)
-                weight_deq = (weight_f - offset) * scales
-            weight_deq = weight_deq.reshape((weight_deq.shape[0], -1))
-
-            if has_g_idx:
-                weight_deq = weight_deq[:, inv_perm]
+            if sort_indices is not None:
+                unpacked_weight = unpacked_weight[:, sort_indices]
+                
+            unpacked_zp = None
+            if zero_point is not None:
+                unpacked_zp = self._unpack_packed_tensor(zero_point.T).T.astype(jnp.int8)
 
             return process_linear_weights(
                 LinearWeights(
-                    weight=weight_deq,
-                    weight_scale=None,
-                    zero_point=None,
+                    weight=unpacked_weight,
+                    weight_scale=weight_scale,
+                    zero_point=unpacked_zp,
                     bias=bias,
                 ),
                 fused=self.linear_config.fuse_matmuls,
@@ -265,9 +230,7 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
                 reorder_size=self.linear_config.n_shards,
             )
 
-        weights = process_wna16_linear_weights(
-            weight_packed, weight_scale, zero_point, bias, perm, inv_perm)
-
+        weights = process_wna16_weights(weight, weight_scale, zero_point, bias, sort_indices)
         weights = torch_view(
             shard_linear_weights(
                 weights,
@@ -276,14 +239,51 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
                 bias_p_spec=self.linear_config.bias_sharding,
             ))
 
+        # Reassign to new attribute names to avoid shape mismatch issues 
+        # (since original tensors were int32 packed, and these are now int8 unpacked)
         if self.linear_config.fuse_matmuls:
-            layer.weight = Parameter(weights.weight, requires_grad=False)
-            if bias is not None:
+            layer.weight_unpacked = Parameter(weights.weight, requires_grad=False)
+            if weights.weight_scale is not None:
+                layer.weight_scale = Parameter(weights.weight_scale, requires_grad=False)
+            if weights.zero_point is not None:
+                layer.weight_zero_point_unpacked = Parameter(weights.zero_point, requires_grad=False)
+            if weights.bias is not None:
                 layer.bias = Parameter(weights.bias, requires_grad=False)
         else:
-            layer.weight = to_parameter_list(weights.weight)
-            if bias is not None:
+            layer.weight_unpacked = to_parameter_list(weights.weight)
+            if weights.weight_scale is not None:
+                layer.weight_scale = to_parameter_list(weights.weight_scale)
+            if weights.zero_point is not None:
+                layer.weight_zero_point_unpacked = to_parameter_list(weights.zero_point)
+            if weights.bias is not None:
                 layer.bias = to_parameter_list(weights.bias)
+                
+        # Save sort_indices to permute the input 'x' in the forward pass
+        if sort_indices is not None:
+            layer.sort_indices = Parameter(torch_view(sort_indices), requires_grad=False)
+
+    def _dequantize_to_bf16(self, weight_unpacked: jax.Array, weight_scale: jax.Array, 
+                           zero_point_unpacked: Optional[jax.Array]) -> jax.Array:
+        """Standard sequential group dequantization directly from unpacked int8 tensors."""
+        out_features, in_features = weight_unpacked.shape
+        w_bf16 = weight_unpacked.astype(jnp.bfloat16)
+
+        effective_gs = in_features if self.group_size == -1 else self.group_size
+        num_groups = in_features // effective_gs
+
+        # Reshape to expose the groups: (out_features, num_groups, group_size)
+        w_grouped = w_bf16.reshape((out_features, num_groups, effective_gs))
+        scale_expanded = jnp.expand_dims(weight_scale, -1)
+
+        if zero_point_unpacked is not None:
+            zp_bf16 = jnp.expand_dims(zero_point_unpacked.astype(jnp.bfloat16), -1)
+            w_deq_grouped = (w_grouped - zp_bf16) * scale_expanded
+        else:
+            # Shift by implicit offset if symmetric
+            offset = jnp.array(1 << (self.num_bits - 1), dtype=jnp.bfloat16)
+            w_deq_grouped = (w_grouped - offset) * scale_expanded
+        
+        return w_deq_grouped.reshape((out_features, in_features))
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
@@ -297,31 +297,50 @@ class VllmCompressedTensorsWNA16(CompressedTensorsScheme):
     def _apply_fused(self, layer: torch.nn.Module, x: torch.Tensor,
                      bias: Optional[torch.Tensor]) -> torch.Tensor:
         x_jax = jax_view(x)
-        weight = jax_view(layer.weight)
+        
+        # If we permuted weights at load time, we must permute x at runtime
+        if hasattr(layer, "sort_indices"):
+            sort_idx = jax_view(layer.sort_indices)
+            x_jax = x_jax[..., sort_idx]
 
-        outs = jnp.einsum("bd,fd->bf", x_jax, weight)
+        weight_unpacked = jax_view(layer.weight_unpacked)
+        w_scale = jax_view(layer.weight_scale)
+        zp = jax_view(layer.weight_zero_point_unpacked) if hasattr(layer, "weight_zero_point_unpacked") else None
+        
+        weight_bf16 = self._dequantize_to_bf16(weight_unpacked, w_scale, zp)
+        outs = jnp.einsum("bd,fd->bf", x_jax, weight_bf16)
 
         if bias is not None and not layer.skip_bias_add:
-            outs += bias.jax()
+            outs += jax_view(bias)
 
         outs = slice_sharded_tensor_for_concatenation(
-            outs, self.linear_config.output_sizes, self.linear_config.n_shards)
+            outs, self.linear_config.output_sizes,
+            self.linear_config.n_shards)
         out = jnp.concatenate(outs, axis=-1)
         return torch_view(out)
 
     def _apply_split(self, layer: torch.nn.Module, x: torch.Tensor,
                      bias: Optional[torch.Tensor]) -> torch.Tensor:
-        assert isinstance(layer.weight, torch.nn.ParameterList)
-
+        assert isinstance(layer.weight_unpacked, torch.nn.ParameterList)
         x_jax = jax_view(x)
+        
+        if hasattr(layer, "sort_indices"):
+            sort_idx = jax_view(layer.sort_indices)
+            x_jax = x_jax[..., sort_idx]
+
         outs = []
-        for i, w in enumerate(layer.weight):
-            weight = jax_view(w)
-            out = jnp.einsum("bd,fd->bf", x_jax, weight)
+        for i in range(len(layer.weight_unpacked)):
+            weight_unpacked = jax_view(layer.weight_unpacked[i])
+            w_scale = jax_view(layer.weight_scale[i])
+            zp = jax_view(layer.weight_zero_point_unpacked[i]) if hasattr(layer, "weight_zero_point_unpacked") else None
+            
+            weight_bf16 = self._dequantize_to_bf16(weight_unpacked, w_scale, zp)
+            out = jnp.einsum("bd,fd->bf", x_jax, weight_bf16)
 
             if bias is not None and not layer.skip_bias_add:
                 out += jax_view(bias[i])
 
             outs.append(out)
+
         out = jnp.concatenate(outs, axis=-1)
         return torch_view(out)
