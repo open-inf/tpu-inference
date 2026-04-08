@@ -505,8 +505,15 @@ class VllmModelWrapper:
             lora_metadata,
         ) -> jax.Array:
             lora_metadata = torch_view(lora_metadata)
+            # set_forward_context is required so that vllm.ir ops (e.g.
+            # rms_norm in compute_logits' final norm) honor
+            # ir_enable_torch_wrap=False and dispatch directly through
+            # the native impl rather than via torch.ops.vllm_ir, which
+            # otherwise breaks out of the torchax env.
             with torchax.default_env(), set_vllm_model_wrapper_context(
-                    kv_caches=None, mesh=self.mesh):
+                    kv_caches=None,
+                    mesh=self.mesh), set_forward_context(
+                        attn_metadata=None, vllm_config=self.vllm_config):
                 original_lora_metadata = replace_lora_metadata(
                     self.model, lora_metadata, self.vllm_config.lora_config)
                 logits = torch.func.functional_call(

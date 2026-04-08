@@ -74,6 +74,20 @@ def swigluoai(gate: jax.Array,
     return (up + 1.0) * glu
 
 
+def swiglustep(gate: jax.Array,
+               up: jax.Array,
+               *,
+               limit: float = 7.0) -> jax.Array:
+    """SwiGLU with clamping. Used in models such as Step3p5.
+
+    Equivalent to vllm's `SwigluStepAndMul`:
+        silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+    """
+    gate = jnp.clip(jax.nn.silu(gate), max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return gate * up
+
+
 def apply_act_fn(acc1, acc3, act_fn):
     if act_fn == "silu":
         return jax.nn.silu(acc1) * acc3
@@ -81,6 +95,8 @@ def apply_act_fn(acc1, acc3, act_fn):
         return jax.nn.gelu(acc1) * acc3
     elif act_fn == "swigluoai":
         return swigluoai(acc1, acc3)
+    elif act_fn == "swiglustep":
+        return swiglustep(acc1, acc3)
     else:
         raise NotImplementedError(f"Unsupported activation function: {act_fn}")
 

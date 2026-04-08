@@ -39,6 +39,20 @@ def swigluoai(gate: jax.Array,
     return (up + 1.0) * glu
 
 
+def swiglustep(gate: jax.Array,
+               up: jax.Array,
+               *,
+               limit: float = 7.0) -> jax.Array:
+    """SwiGLU with clamping. Used in models such as Step3p5.
+
+    Equivalent to vllm's `SwigluStepAndMul`:
+        silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+    """
+    gate = jnp.clip(jax.nn.silu(gate), max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
+    return gate * up
+
+
 def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -49,7 +63,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
     Args:
         acc: The accumulator array, with the last dimension being 2 * tile_n.
         fuse_act: The name of the activation function to apply. Supported values are
-            "silu", "gelu", and "swigluoai". If None, no activation is applied.
+            "silu", "gelu", "swigluoai", and "swiglustep". If None, no activation
+            is applied.
 
     Returns:
         The result of applying the activation function.
@@ -69,6 +84,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
             return swigluoai(acc_gate, acc_up)
+        case "swiglustep":
+            return swiglustep(acc_gate, acc_up)
         case _:
             raise NotImplementedError(
                 f"Unsupported activation function: {fuse_act}")
